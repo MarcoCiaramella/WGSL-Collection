@@ -18,6 +18,7 @@ getGPUDevice()
             let bufferSize = 0;
             const sizes = getMessageSizes(bytesArray[0]);
             bytesArray.forEach(bytes => {
+                if (bytes.length % 4 !== 0) throw "Message must be 32-bit aligned";
                 const message = padMessage(bytes, sizes[1]);
                 // message is the padded version of the input message as dscribed by SHA-256 specification
                 messages.push(message);
