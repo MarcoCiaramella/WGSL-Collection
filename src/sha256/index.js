@@ -60,7 +60,7 @@ getGPUDevice()
             });
 
             const shaderModule = device.createShaderModule({
-                code: await (await fetch("sha256.wgsl")).text()
+                code: await (await fetch("shader.wgsl")).text()
             });
 
             const computePipeline = device.createComputePipeline({
