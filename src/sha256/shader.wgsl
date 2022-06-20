@@ -1,3 +1,4 @@
+// SHA-256 for 32-bit aligned messages
 
 fn swap_endianess32(val: u32) -> u32 {
     return ((val>>24u) & 0xffu) | ((val>>8u) & 0xff00u) | ((val<<8u) & 0xff0000u) | ((val<<24u) & 0xff000000u);
