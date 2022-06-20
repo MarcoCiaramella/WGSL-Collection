@@ -142,7 +142,7 @@ getGPUDevice()
         // each message in messages must have the same size
         await sha256(messages);
     })
-    .catch(err => console.log(err));
+    .catch(err => console.error(err));
 
 function buf2hex(buffer) {
     return new Uint8Array(buffer).reduce((a, b) => a + b.toString(16).padStart(2, '0'), '0x');
