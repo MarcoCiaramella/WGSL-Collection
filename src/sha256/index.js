@@ -1,151 +1,11 @@
-
 async function getGPUDevice() {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) {
-        alert("No adapter");
+        throw "No adapter";
     }
     else {
         return await adapter.requestDevice();
     }
-}
-
-getGPUDevice()
-    .then(async device => {
-
-        async function sha256(bytesArray) {
-
-            const messages = [];
-            let bufferSize = 0;
-            const sizes = getMessageSizes(bytesArray[0]);
-            bytesArray.forEach(bytes => {
-                if (bytes.length % 4 !== 0) throw "Message must be 32-bit aligned";
-                const message = padMessage(bytes, sizes[1]);
-                // message is the padded version of the input message as dscribed by SHA-256 specification
-                messages.push(message);
-                // messages has same size
-                bufferSize += message.byteLength;
-            });
-            const numMessages = messages.length;
-
-            // build shader input data
-            const messageArray = new Uint32Array(new ArrayBuffer(bufferSize));
-            let offset = 0;
-            messages.forEach(message => {
-                messageArray.set(message, offset);
-                offset += message.length;
-            });
-
-            // messages
-            const messageArrayBuffer = device.createBuffer({
-                mappedAtCreation: true,
-                size: messageArray.byteLength,
-                usage: GPUBufferUsage.STORAGE
-            });
-            new Uint32Array(messageArrayBuffer.getMappedRange()).set(messageArray);
-            messageArrayBuffer.unmap();
-
-            // sizes
-            const sizesBuffer = device.createBuffer({
-                mappedAtCreation: true,
-                size: sizes.byteLength,
-                usage: GPUBufferUsage.STORAGE
-            });
-            new Uint32Array(sizesBuffer.getMappedRange()).set(sizes);
-            sizesBuffer.unmap();
-
-            // Result
-            const resultBufferSize = (256 / 8) * numMessages;
-            const resultBuffer = device.createBuffer({
-                size: resultBufferSize,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
-            });
-
-            const shaderModule = device.createShaderModule({
-                code: await (await fetch("shader.wgsl")).text()
-            });
-
-            const computePipeline = device.createComputePipeline({
-                compute: {
-                    module: shaderModule,
-                    entryPoint: "sha256"
-                },
-                layout: 'auto'
-            });
-
-            const bindGroup = device.createBindGroup({
-                layout: computePipeline.getBindGroupLayout(0),
-                entries: [
-                    {
-                        binding: 0,
-                        resource: {
-                            buffer: messageArrayBuffer
-                        }
-                    },
-                    {
-                        binding: 1,
-                        resource: {
-                            buffer: sizesBuffer
-                        }
-                    },
-                    {
-                        binding: 2,
-                        resource: {
-                            buffer: resultBuffer
-                        }
-                    }
-                ]
-            });
-
-            const commandEncoder = device.createCommandEncoder();
-
-            const passEncoder = commandEncoder.beginComputePass();
-            passEncoder.setPipeline(computePipeline);
-            passEncoder.setBindGroup(0, bindGroup);
-            passEncoder.dispatchWorkgroups(1, 1);
-            passEncoder.end();
-
-            const gpuReadBuffer = device.createBuffer({
-                size: resultBufferSize,
-                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-            });
-            commandEncoder.copyBufferToBuffer(
-                resultBuffer,
-                0,
-                gpuReadBuffer,
-                0,
-                resultBufferSize
-            );
-
-            const gpuCommands = commandEncoder.finish();
-            device.queue.submit([gpuCommands]);
-
-            await gpuReadBuffer.mapAsync(GPUMapMode.READ);
-
-            const hashSize = 256 / 8;
-            for (let i = 0; i < numMessages; i++) {
-                console.log(buf2hex(gpuReadBuffer.getMappedRange(i * hashSize, hashSize)));
-            }
-        }
-
-        // at the current version of WGSL u64 is not supported. This force the max message length to be ((2^32) - 1) / 32
-        const messages = [
-            [0x01, 0x00, 0x00, 0x00], // int 1
-            [0x02, 0x00, 0x00, 0x00], // int 2
-            [0x03, 0x00, 0x00, 0x00], // int 3
-            [0x04, 0x00, 0x00, 0x00], // int 4
-            [0x05, 0x00, 0x00, 0x00], // int 5
-            [0x06, 0x00, 0x00, 0x00], // int 6
-            [0x07, 0x00, 0x00, 0x00], // int 7
-            [0x08, 0x00, 0x00, 0x00], // int 8
-            [0x09, 0x00, 0x00, 0x00]  // int 9
-        ];
-        // each message in messages must have the same size
-        await sha256(messages);
-    })
-    .catch(err => console.error(err));
-
-function buf2hex(buffer) {
-    return new Uint8Array(buffer).reduce((a, b) => a + b.toString(16).padStart(2, '0'), '0x');
 }
 
 function padMessage(bytes, size) {
@@ -165,3 +25,180 @@ function getMessageSizes(bytes) {
     u32Arr[1] = lenBitPadded / 32;
     return u32Arr;
 }
+
+function calcNumWorkgroups(device, messages) {
+    const numWorkgroups = Math.ceil(messages.length / 256);
+    if (numWorkgroups > device.limits.maxComputeWorkgroupsPerDimension) {
+        throw `Input array too large. Max size is ${device.limits.maxComputeWorkgroupsPerDimension / 256}.`;
+    }
+    return numWorkgroups;
+}
+
+let device;
+
+/**
+ * 
+ * @param {Uint8Array[]} messages messages to hash. Each message must be 32-bit aligned with the same size
+ * @returns {Uint8Array[]} hashes
+ */
+async function sha256(messages) {
+
+    for (const message of messages) {
+        if (message.length !== messages[0].length) throw "Messages must have the same size";
+    }
+
+    device = device ? device : await getGPUDevice();
+
+    const numWorkgroups = calcNumWorkgroups(device, messages);
+
+    const messagesPad = [];
+    let bufferSize = 0;
+    const messageSizes = getMessageSizes(messages[0]);
+    for (const message of messages) {
+        if (message.length % 4 !== 0) throw "Message must be 32-bit aligned";
+        const messagePad = padMessage(message, messageSizes[1]);
+        // message is the padded version of the input message as dscribed by SHA-256 specification
+        messagesPad.push(messagePad);
+        // messages has same size
+        bufferSize += messagePad.byteLength;
+    }
+    const numMessages = messagesPad.length;
+
+    // build shader input data
+    const messageArray = new Uint32Array(new ArrayBuffer(bufferSize));
+    let offset = 0;
+    for (const message of messagesPad) {
+        messageArray.set(message, offset);
+        offset += message.length;
+    }
+
+    // messages
+    const messageArrayBuffer = device.createBuffer({
+        mappedAtCreation: true,
+        size: messageArray.byteLength,
+        usage: GPUBufferUsage.STORAGE
+    });
+    new Uint32Array(messageArrayBuffer.getMappedRange()).set(messageArray);
+    messageArrayBuffer.unmap();
+
+    // num_messages
+    const numMessagesBuffer = device.createBuffer({
+        mappedAtCreation: true,
+        size: Uint32Array.BYTES_PER_ELEMENT,
+        usage: GPUBufferUsage.STORAGE
+    });
+    new Uint32Array(numMessagesBuffer.getMappedRange()).set([messagesPad.length]);
+    numMessagesBuffer.unmap();
+
+    // message_sizes
+    const messageSizesBuffer = device.createBuffer({
+        mappedAtCreation: true,
+        size: messageSizes.byteLength,
+        usage: GPUBufferUsage.STORAGE
+    });
+    new Uint32Array(messageSizesBuffer.getMappedRange()).set(messageSizes);
+    messageSizesBuffer.unmap();
+
+    // Result
+    const resultBufferSize = (256 / 8) * numMessages;
+    const resultBuffer = device.createBuffer({
+        size: resultBufferSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+    });
+
+    const shaderModule = device.createShaderModule({
+        code: await (await fetch("shader.wgsl")).text()
+    });
+
+    const computePipeline = device.createComputePipeline({
+        compute: {
+            module: shaderModule,
+            entryPoint: "sha256"
+        },
+        layout: 'auto'
+    });
+
+    const bindGroup = device.createBindGroup({
+        layout: computePipeline.getBindGroupLayout(0),
+        entries: [
+            {
+                binding: 0,
+                resource: {
+                    buffer: messageArrayBuffer
+                }
+            },
+            {
+                binding: 1,
+                resource: {
+                    buffer: numMessagesBuffer
+                }
+            },
+            {
+                binding: 2,
+                resource: {
+                    buffer: messageSizesBuffer
+                }
+            },
+            {
+                binding: 3,
+                resource: {
+                    buffer: resultBuffer
+                }
+            }
+        ]
+    });
+
+    const commandEncoder = device.createCommandEncoder();
+
+    const passEncoder = commandEncoder.beginComputePass();
+    passEncoder.setPipeline(computePipeline);
+    passEncoder.setBindGroup(0, bindGroup);
+    passEncoder.dispatchWorkgroups(numWorkgroups);
+    passEncoder.end();
+
+    const gpuReadBuffer = device.createBuffer({
+        size: resultBufferSize,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+    });
+    commandEncoder.copyBufferToBuffer(
+        resultBuffer,
+        0,
+        gpuReadBuffer,
+        0,
+        resultBufferSize
+    );
+
+    const gpuCommands = commandEncoder.finish();
+    device.queue.submit([gpuCommands]);
+
+    await gpuReadBuffer.mapAsync(GPUMapMode.READ);
+
+    const hashSize = 256 / 8;
+    const hashes = [];
+    for (let i = 0; i < numMessages; i++) {
+        hashes.push(new Uint8Array(gpuReadBuffer.getMappedRange(i * hashSize, hashSize)));
+    }
+
+    return hashes;
+}
+
+// at the current version of WGSL u64 is not supported. This force the max message length to be ((2^32) - 1) / 32
+const messages = [
+    new Uint8Array([0x01, 0x00, 0x00, 0x00]), // int 1
+    new Uint8Array([0x02, 0x00, 0x00, 0x00]), // int 2
+    new Uint8Array([0x03, 0x00, 0x00, 0x00]), // int 3
+    new Uint8Array([0x04, 0x00, 0x00, 0x00]), // int 4
+    new Uint8Array([0x05, 0x00, 0x00, 0x00]), // int 5
+    new Uint8Array([0x06, 0x00, 0x00, 0x00]), // int 6
+    new Uint8Array([0x07, 0x00, 0x00, 0x00]), // int 7
+    new Uint8Array([0x08, 0x00, 0x00, 0x00]), // int 8
+    new Uint8Array([0x09, 0x00, 0x00, 0x00])  // int 9
+];
+// each message in messages must have the same size
+sha256(messages)
+    .then(hashes => {
+        for (const hash of hashes) {
+            console.log(hash.reduce((a, b) => a + b.toString(16).padStart(2, '0'), ''));
+        }
+    })
+    .catch(err => console.error(err));
